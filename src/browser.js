@@ -6,6 +6,7 @@ const { log } = require("./log");
 
 let sessionPromise = null;
 let displayReady = null;
+let xvfbChild = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -19,24 +20,80 @@ class NodeError extends Error {
   }
 }
 
+function virtualDisplay() {
+  const requested = process.env.GMGN_DISPLAY || ":95";
+  const match = /^:(\d+)/.exec(requested);
+  return match ? `:${match[1]}` : ":95";
+}
+
+function displaySocket(display) {
+  return `/tmp/.X11-unix/X${display.slice(1)}`;
+}
+
 function ensureDisplay() {
-  if (process.env.DISPLAY) return Promise.resolve(process.env.DISPLAY);
+  // An inherited SSH display (localhost:10.0) has no local screen and Chrome waits on it forever.
+  const display = virtualDisplay();
+  const socketPath = displaySocket(display);
+  if (fs.existsSync(socketPath)) {
+    process.env.DISPLAY = display;
+    return Promise.resolve(display);
+  }
   if (displayReady) return displayReady;
 
   displayReady = new Promise((resolve, reject) => {
-    const display = process.env.GMGN_DISPLAY || ":95";
+    let settled = false;
+    let timer = null;
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (err) {
+        displayReady = null;
+        if (xvfbChild) {
+          xvfbChild.kill("SIGTERM");
+          xvfbChild = null;
+        }
+        reject(err);
+        return;
+      }
+      process.env.DISPLAY = display;
+      if (xvfbChild) xvfbChild.unref();
+      resolve(display);
+    };
+
     const child = spawn(
       "Xvfb",
       [display, "-screen", "0", "1280x800x24", "-nolisten", "tcp", "-ac"],
-      { stdio: "ignore", detached: true },
+      { stdio: "ignore" },
     );
+    xvfbChild = child;
     child.on("error", (err) => {
-      displayReady = null;
-      reject(new NodeError(`Xvfb failed to start (${err.message}).`, 503, "display_unavailable"));
+      xvfbChild = null;
+      finish(new NodeError(`Xvfb failed to start (${err.message}).`, 503, "display_unavailable"));
     });
-    child.unref();
-    process.env.DISPLAY = display;
-    setTimeout(() => resolve(display), 400);
+    child.on("exit", (code, signal) => {
+      if (xvfbChild === child) xvfbChild = null;
+      if (fs.existsSync(socketPath)) {
+        finish();
+        return;
+      }
+      finish(new NodeError(`Xvfb exited (${signal || code}).`, 503, "display_unavailable"));
+    });
+
+    const deadline = Date.now() + 5000;
+    const poll = () => {
+      if (settled) return;
+      if (fs.existsSync(socketPath)) {
+        finish();
+        return;
+      }
+      if (Date.now() >= deadline) {
+        finish(new NodeError(`Xvfb did not open ${socketPath}.`, 503, "display_unavailable"));
+        return;
+      }
+      timer = setTimeout(poll, 50);
+    };
+    timer = setTimeout(poll, 50);
   });
   return displayReady;
 }
@@ -143,7 +200,17 @@ async function sessionStatus() {
   };
 }
 
+function stopXvfb() {
+  const child = xvfbChild;
+  xvfbChild = null;
+  displayReady = null;
+  if (child && child.exitCode == null && !child.killed) child.kill("SIGTERM");
+}
+
 async function closeBrowser() {
+  // Stop Xvfb before the first await. Playwright's own SIGINT handler exits the process
+  // as soon as this function yields, which would leave the virtual display behind.
+  stopXvfb();
   await resetSession();
 }
 
