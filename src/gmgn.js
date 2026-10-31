@@ -6,6 +6,16 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+let cooledUntil = 0;
+let rateStrikes = 0;
+
+function rateLimitWait() {
+  rateStrikes = Math.min(rateStrikes + 1, 4);
+  const wait = 1500 * rateStrikes;
+  cooledUntil = Date.now() + wait;
+  return wait;
+}
+
 function lanesFor(session) {
   if (!session.lanes) {
     const pages = session.pages?.length ? session.pages : [session.page];
@@ -98,6 +108,9 @@ async function fetchGmgn(request) {
   const started = Date.now();
   let lastError = null;
   for (let attempt = 0; attempt < 4; attempt++) {
+    if (Date.now() < cooledUntil) {
+      throw new NodeError("GMGN rate limited the request.", 429, "rate_limited");
+    }
     const session = await getSession();
     const lane = claimLane(session);
     const windowNo = lanesFor(session).indexOf(lane) + 1;
@@ -115,10 +128,9 @@ async function fetchGmgn(request) {
       /just a moment|attention required/i.test(result.text.slice(0, 400));
 
     if (result.status === 429) {
-      lastError = new NodeError("GMGN rate limited the request.", 429, "rate_limited");
-      log(`${method} ${path} window=${windowNo} rate limited, retry ${attempt + 1}`);
-      await sleep(1500 * (attempt + 1));
-      continue;
+      const wait = rateLimitWait();
+      log(`${method} ${path} window=${windowNo} rate limited, cooling ${wait}ms`);
+      throw new NodeError("GMGN rate limited the request.", 429, "rate_limited");
     }
     if (blocked) {
       lastError = new NodeError("Cloudflare blocked the GMGN request.", 503, "cloudflare_blocked");
@@ -137,6 +149,8 @@ async function fetchGmgn(request) {
     }
     const code = body && typeof body === "object" && body.code != null ? body.code : "-";
     log(`${method} ${path} window=${windowNo} -> ${result.status} code=${code} ${Date.now() - started}ms`);
+    rateStrikes = 0;
+    cooledUntil = 0;
     return { status: result.status, body };
   }
   log(`${method} ${path} failed ${lastError?.code || "gmgn_error"} ${Date.now() - started}ms`);
